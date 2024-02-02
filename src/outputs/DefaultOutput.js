@@ -11,6 +11,7 @@ export default class DefaultOutput extends Output {
 				content += `${asset.content}\n/*${"*".repeat(50)}*/\n`;
 			}
 
+			console.log("CHUNK", chunk.path);
 			writeFile(chunk.path, content, { encoding: "utf-8" });
 		}
 	}

@@ -3,6 +3,7 @@ import Loader from "../Loader.js";
 import walk from "../util/walk.js";
 import { basename, dirname } from "path";
 import LoaderResult from "../LoaderResult.js";
+import { computeSourceLocation } from "../util/source.js";
 
 export const IMPORT = 0;
 export const EXPORT = 1;
@@ -20,10 +21,10 @@ export default class JavascriptLoader extends Loader {
 
 	async load(asset, bundler) {
 		let source = asset.content;
-		let projectPath = await bundler.resolveProjectPath(asset.path);
+		let projectPath = bundler.resolveProjectPath(asset.path);
 		let program = await this.parse(source);
-		let imports = await this.getImports(program, dirname(asset.path), bundler);
-		let exports = await this.getExports(program, source);
+		let imports = this.getImports(program, source, asset.path, dirname(asset.path), bundler);
+		let exports = this.getExports(program, source);
 		let statements = []
 			.concat(imports.map(i => ({ type: IMPORT, info: i })))
 			.concat(exports.map(e => ({ type: EXPORT, info: e })))
@@ -36,18 +37,21 @@ export default class JavascriptLoader extends Loader {
 		let result = new LoaderResult(asset);
 
 		for (let i of imports) {
-			result.addPathReference(i.absolutePath, { async: i.type === DYNAMIC_IMPORT });
+			result.addPathReference(i.absolutePath, {
+				async: i.type === DYNAMIC_IMPORT,
+				location: i.location
+			});
 		}
 
 		return result;
 	}
 
-	async getExports(program, source) {
+	getExports(program, source) {
 		let exports = [];
 
 		walk(program, ["ExportDefaultDeclaration", "ExportNamedDeclaration"], node => exports.push(node));
 
-		return Promise.all(exports.map(async e => {
+		return exports.map(e => {
 			if (e.type === "ExportDefaultDeclaration") {
 				return {
 					start: e.start,
@@ -58,31 +62,37 @@ export default class JavascriptLoader extends Loader {
 				return {
 					start: e.start,
 					end: e.end,
-					declarations: e.declaration.declarations
-						? e.declaration.declarations.map(n => this.normalizeExportDeclaration(source, n, e.declaration.kind))
-						: [this.normalizeExportDeclaration(source, e.declaration, e.declaration.kind)]
+					declarations: e.declaration
+						? (e.declaration.declarations
+							? e.declaration.declarations.map(n => this.normalizeExportDeclaration(source, n, e.declaration.kind))
+							: [this.normalizeExportDeclaration(source, e.declaration, e.declaration.kind)])
+						: (e.specifiers.map(s => ({
+							type: CONST_EXPORT,
+							name: s.exported.name,
+							value: s.local.name
+						})))
 				};
 			}
-		}));
+		});
 	}
 
-	async getImports(program, directory, bundler) {
+	getImports(program, source, path, directory, bundler) {
 		let imports = [];
 
 		walk(program, ["ImportDeclaration", "ImportExpression", "CallExpression"], node => imports.push(node));
 
-		return Promise.all(imports.map(async (i, n) => {
+		return imports.map((i, n) => {
 			if (i.type === "ImportDeclaration") {
 				return {
 					type: STATIC_IMPORT,
 					path: i.source.value,
 					identifier: basename(i.source.value).replace(/[.@/-]+/g, "_") + `_${n}`,
-					absolutePath: await bundler.resolveAbsolutePath(i.source.value, directory),
-					projectPath: await bundler.resolveProjectPath(i.source.value, directory),
+					absolutePath: bundler.resolveAbsolutePath(i.source.value, directory),
+					projectPath: bundler.resolveProjectPath(i.source.value, directory),
 					start: i.start,
 					end: i.end,
 					symbols: i.specifiers.map(s => {
-						let imported = s.type === "ImportDefaultSpecifier" ? "default" : s.imported.name;
+						let imported = s.type === "ImportDefaultSpecifier" ? "default" : s.imported?.name || s.local.name;
 						let local = s.local.name;
 						return {
 							imported,
@@ -95,24 +105,29 @@ export default class JavascriptLoader extends Loader {
 				return {
 					type: DYNAMIC_IMPORT,
 					path: i.source.value,
-					absolutePath: await bundler.resolveAbsolutePath(i.source.value, directory),
-					projectPath: await bundler.resolveProjectPath(i.source.value, directory),
+					absolutePath: bundler.resolveAbsolutePath(i.source.value, directory),
+					projectPath: bundler.resolveProjectPath(i.source.value, directory),
 					start: i.start,
 					end: i.end
 				};
-			} else if (i.type === "CallExpression" && i.callee.name === "require") {
+			} else if (i.type === "CallExpression" && i.callee.name === "require" && i.arguments[0].type === "Literal") {
 				let path = i.arguments[0].value;
 				return {
 					path,
 					type: COMMONJS_IMPORT,
 					identifier: path.replace(/[.@/-]+/g, "_") + `_${n}`,
-					absolutePath: await bundler.resolveAbsolutePath(path, directory),
-					projectPath: await bundler.resolveProjectPath(path, directory),
+					absolutePath: bundler.resolveAbsolutePath(path, directory),
+					projectPath: bundler.resolveProjectPath(path, directory),
 					start: i.start,
 					end: i.end
-				}
+				};
 			}
-		})).then(imports => imports.filter(i => !!i));
+		})
+			.filter(i => !!i)
+			.map(i => ({
+				...i,
+				location: computeSourceLocation(source, path, i.start, i.end)
+			}));
 	}
 
 	normalizeExportDeclaration(source, node, kind, isDefault = false) {
@@ -120,7 +135,7 @@ export default class JavascriptLoader extends Loader {
 		let type;
 		let value;
 
-		if (node.type === "FunctionDeclaration") {
+		if (node.type === "FunctionDeclaration" || node.type === "ClassDeclaration") {
 			type = CONST_EXPORT;
 			value = source.slice(node.start, node.end);
 		} else {

@@ -1,4 +1,3 @@
-import Asset from "./Asset.js";
 import AssetReference from "./AssetReference.js";
 
 export default class Graph {

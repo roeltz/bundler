@@ -1,8 +1,10 @@
-import { realpath } from "fs/promises";
-import { createRequire } from "module";
+import { isBuiltin } from "module";
 import Graph from "./Graph.js";
-import { relative, resolve } from "path";
+import { dirname, isAbsolute, relative } from "path";
 import Asset from "./Asset.js";
+import { existsSync } from "fs";
+import { realpath } from "fs/promises";
+import resolve from "./util/resolve.js";
 
 export default class Bundler {
 
@@ -18,8 +20,11 @@ export default class Bundler {
 
 		if (references) {
 			for (let r of references) {
-				let referencedAsset = await this.processPath(r.path, asset.path);
-				this.graph.addAssetReference(asset, referencedAsset, r.metadata);
+				let referencedAsset = await this.processPath(r.path, r.metadata.location);
+
+				if (referencedAsset) {
+					this.graph.addAssetReference(asset, referencedAsset, r.metadata);
+				}
 			}
 		}
 	}
@@ -31,63 +36,94 @@ export default class Bundler {
 	async bundle() {
 		let entries = this.config.entries;
 
+		this._processedPaths = [];
+
 		for (let entry of entries) {
-			let absoluteEntry = await this.resolveAbsolutePath(entry);
-			let entryAsset = await this.processPath(absoluteEntry, this.currentDirectory);
+			let absoluteEntry = this.resolveAbsolutePath(entry);
+			let entryAsset = await this.processPath(absoluteEntry);
+			this.graph.addAsset(entryAsset);
 			this.graph.setEntryAsset(entryAsset);
 		}
+
+		delete this._processedPaths;
 
 		let chunks = await this.chunker.chunk(this);
 		await this.output.write(chunks, this);
 	}
 
 	getLoadersForPath(path) {
+		let absolutePath = this.resolveAbsolutePath(path);
+
 		for (let { pattern, loaders } of this.loaders) {
-			if (pattern.test(path)) {
+			if (pattern.test(absolutePath)) {
 				return loaders;
 			}
 		}
 	}
 
-	async processPath(path) {
+	async processPath(path, contextLocation) {
+		if (this._processedPaths.includes(path)) {
+			console.log("ALREADY Processed:", path);
+			return;
+		}
+
+		if (isBuiltin(path)) {
+			return new Asset(`node:${path}`, `$$MODULE.exports = require("${path}")`);
+		}
+
 		let existingAsset = this.graph.getAssetByPath(path);
 
 		if (existingAsset) {
+			console.log("Existing:", path);
 			return existingAsset;
 		}
 
-		let loaders = this.getLoadersForPath(path);
+		let loaders = this.getLoadersForPath(path, dirname(path));
 
-		if (loaders.length) {
+		if (loaders) {
 			let asset = await Asset.fromPath(path);
 
 			for (let loader of loaders) {
 				let result = await loader.load(asset, this);
-				asset = await this.processResult(result);
+				this._processedPaths.push(asset.path);
+				await this.addAsset(result.asset, result.references);
+				asset = result.asset;
 			}
+
+			console.log("Processed:", path);
 
 			return asset;
 		} else {
-			throw new Error(`Loader not found for asset: ${path}`);
+			if (contextLocation) {
+				throw new Error(`Loader not found for asset: ${path} (Requested from ${contextLocation.path}:${contextLocation.line}:${contextLocation.column})`);
+			} else {
+				throw new Error(`Loader not found for asset: ${path}`);
+			}
 		}
 	}
 
-	async processResult(result) {
-		await this.addAsset(result.asset, result.references);
-		return result.asset;
-	}
+	resolveAbsolutePath(path, directory = this.currentDirectory) {
+		if (isBuiltin(path)) {
+			return path;
+		}
 
-	async resolveAbsolutePath(path, directory = this.currentDirectory) {
-		if (/^..?\//.test(path)) {
-			return resolve(directory, path);
-		} else {
-			let require = createRequire(directory);
-			return require.resolve(path);
+		if (existsSync(path) && isAbsolute(path)) {
+			return path;
+		}
+
+		try {
+			return resolve(path, directory);
+		} catch (err) {
+			debugger;
 		}
 	}
 
-	async resolveProjectPath(path, directory = this.currentDirectory) {
-		let absolutePath = await this.resolveAbsolutePath(path, directory);
+	resolveProjectPath(path, directory = this.currentDirectory) {
+		if (isBuiltin(path)) {
+			return path;
+		}
+
+		let absolutePath = this.resolveAbsolutePath(path, directory);
 		let projectPath = relative(this.currentDirectory, absolutePath);
 		return projectPath;
 	}
